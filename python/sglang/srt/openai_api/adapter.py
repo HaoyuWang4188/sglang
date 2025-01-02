@@ -71,7 +71,12 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.utils import TOOLS_TAG_LIST, parse_tool_response
+from sglang.srt.utils import (
+    TOOL_SPECIAL_TOKEN_LIST,
+    StreamToolState,
+    parse_stream_tool_response,
+    parse_tool_response,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -877,9 +882,14 @@ def v1_chat_generate_request(
             tools = None
             if request.tools and request.tool_choice != "none":
                 request.skip_special_tokens = False
-                if request.stream:
-                    logger.warning("Streaming is not supported with tools.")
-                    request.stream = False
+
+                # TODO: remove this after the parallel_tool_calls is supported
+                if request.parallel_tool_calls:
+                    logger.warning(
+                        "parallel_tool_calls=True is not supported now, turn it into False."
+                    )
+                    request.parallel_tool_calls = False
+
                 if not isinstance(request.tool_choice, str):
                     tools = [
                         item.function.model_dump()
@@ -1062,7 +1072,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
             tool_choice = request.tool_choice
             tools = request.tools
 
-        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
+        if tool_choice != "none" and any([i in text for i in TOOL_SPECIAL_TOKEN_LIST]):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
             try:
@@ -1080,7 +1090,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
                 logger.error(f"Exception: {e}")
                 return create_error_response(
                     HTTPStatus.BAD_REQUEST,
-                    "Failed to parse fc related info to json format!",
+                    f"Failed to parse function calling response into JSON format! Failed text:\n{text}",
                 )
 
         if to_file:
@@ -1171,6 +1181,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
+    # Streaming response.
     if adapted_request.stream:
 
         async def generate_stream_resp():
@@ -1179,6 +1190,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             n_prev_tokens = {}
             prompt_tokens = {}
             completion_tokens = {}
+            stream_tool_states = {}
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -1188,6 +1200,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    stream_tool_state = stream_tool_states.get(
+                        index, StreamToolState([], dict())
+                    )
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1264,9 +1279,41 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
+                    if request.tools and request.tool_choice != "none":
+                        # try to catch tool_special_token if not found
+                        if stream_tool_state.tool_special_token is None:
+                            for tool_special_token in TOOL_SPECIAL_TOKEN_LIST:
+                                if tool_special_token in text:
+                                    stream_tool_state.tool_special_token = (
+                                        tool_special_token
+                                    )
+                                    break
+
+                        # once the special token is catched, parse the tool calls from streaming chunks
+                        if stream_tool_state.tool_special_token is not None:
+                            delta, stream_tool_state = parse_stream_tool_response(
+                                text=text,
+                                delta=delta,
+                                state=stream_tool_state,
+                                tools=request.tools,
+                            )
+                        else:
+                            delta = None
+                    else:
+                        delta = DeltaMessage(content=delta)
+
+                    # update streaming states
+                    is_firsts[index] = is_first
+                    stream_buffers[index] = stream_buffer
+                    n_prev_tokens[index] = n_prev_token
+                    stream_tool_states[index] = stream_tool_state
+
+                    # if delta has content/tools, send the chunk, else skip
+                    if delta is None:
+                        continue
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
-                        delta=DeltaMessage(content=delta),
+                        delta=delta,
                         finish_reason=(finish_reason["type"] if finish_reason else ""),
                         matched_stop=(
                             finish_reason["matched"]
@@ -1280,12 +1327,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         choices=[choice_data],
                         model=request.model,
                     )
-
-                    is_firsts[index] = is_first
-                    stream_buffers[index] = stream_buffer
-                    n_prev_tokens[index] = n_prev_token
-
                     yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # if stream_options.include_usage is True, send the final usage infomation
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens
